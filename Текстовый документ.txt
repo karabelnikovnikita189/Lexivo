@@ -1,0 +1,361 @@
+import os
+import sqlite3
+import asyncio
+import time
+from datetime import date
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from groq import Groq
+from google import genai
+
+
+# 1. Загрузка конфигурации
+load_dotenv()
+
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+
+DAILY_FREE_LIMIT = 3
+STARS_PRICE = 50
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+gemini_client = genai.Client(api_key=GEMINI_API_KEY)
+
+DB_PATH = "bot_database.db"
+
+
+# 2. Инициализация и функции БД
+def init_db():
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            requests_today INTEGER DEFAULT 0,
+            last_request_date TEXT,
+            is_vip INTEGER DEFAULT 0
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def set_vip_status(user_id: int):
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET is_vip = 1 WHERE user_id = ?", (user_id,))
+    if cursor.rowcount == 0:
+        cursor.execute(
+            "INSERT INTO users (user_id, requests_today, last_request_date, is_vip) VALUES (?, 0, ?, 1)",
+            (user_id, str(date.today()))
+        )
+    conn.commit()
+    conn.close()
+
+
+def check_and_update_limit(user_id: int) -> tuple[bool, int]:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    today_str = str(date.today())
+
+    cursor.execute("SELECT requests_today, last_request_date, is_vip FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+
+    if not row:
+        cursor.execute(
+            "INSERT INTO users (user_id, requests_today, last_request_date, is_vip) VALUES (?, 1, ?, 0)",
+            (user_id, today_str)
+        )
+        conn.commit()
+        conn.close()
+        return True, DAILY_FREE_LIMIT - 1
+
+    requests_today, last_request_date, is_vip = row
+
+    if is_vip == 1:
+        conn.close()
+        return True, 999
+
+    if last_request_date != today_str:
+        requests_today = 0
+        last_request_date = today_str
+
+    if requests_today >= DAILY_FREE_LIMIT:
+        conn.close()
+        return False, 0
+
+    requests_today += 1
+    cursor.execute(
+        "UPDATE users SET requests_today = ?, last_request_date = ? WHERE user_id = ?",
+        (requests_today, last_request_date, user_id)
+    )
+    conn.commit()
+    conn.close()
+
+    left_requests = DAILY_FREE_LIMIT - requests_today
+    return True, left_requests
+
+
+def get_user_stats(user_id: int) -> str:
+    conn = sqlite3.connect(DB_PATH)
+    cursor = conn.cursor()
+    today_str = str(date.today())
+
+    cursor.execute("SELECT requests_today, last_request_date, is_vip FROM users WHERE user_id = ?", (user_id,))
+    row = cursor.fetchone()
+    conn.close()
+
+    if not row:
+        return f"📊 **Профиль**\n\nДоступно сегодня: {DAILY_FREE_LIMIT} из {DAILY_FREE_LIMIT}\nСтатус: FREE"
+
+    requests_today, last_request_date, is_vip = row
+
+    if is_vip == 1:
+        return "📊 **Ваш профиль**\n\nСтатус: **PRO (Безлимит)** 👑\nЛимиты полностью отключены!"
+
+    used = 0 if last_request_date != today_str else requests_today
+    left = max(0, DAILY_FREE_LIMIT - used)
+    return (
+        f"📊 **Ваш профиль**\n\n"
+        f"Использовано сегодня: {used}/{DAILY_FREE_LIMIT}\n"
+        f"Осталось попыток: **{left}**\n\n"
+        f"Хотите снимать ограничение? Нажмите кнопку ниже!"
+    )
+
+
+# ==========================================
+# 3. Клавиатуры
+# ==========================================
+def get_main_keyboard():
+    builder = ReplyKeyboardBuilder()
+    builder.row(
+        KeyboardButton(text="📊 Профиль"),
+        KeyboardButton(text="👑 Купить PRO")
+    )
+    builder.row(
+        KeyboardButton(text="ℹ️ Помощь")
+    )
+    return builder.as_markup(resize_keyboard=True)
+
+def get_buy_inline_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="👑 Оплатить 50 Stars", callback_data="buy_pro_stars")
+    return builder.as_markup()
+
+# Кнопка умного перевода и удаления
+def get_action_inline_keyboard():
+    builder = InlineKeyboardBuilder()
+    builder.button(text="🌐 Перевести (RU ⇄ EN)", callback_data="smart_translate")
+    builder.button(text="🗑 Удалить", callback_data="delete_msg")
+    builder.adjust(1)
+    return builder.as_markup()
+
+# 4. Хэндлеры команд и кнопок
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 **Привет! Я бот-транскрибатор.**\n\n"
+        "Присылай мне голосовые сообщения, видеокружки или аудиофайлы — "
+        "я превращу их в текст и сделаю краткую выжимку!\n\n"
+        f"🎁 Вам доступно **{DAILY_FREE_LIMIT} бесплатных распознаваний** в день.",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@dp.message(F.text == "📊 Профиль")
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    stats = get_user_stats(message.from_user.id)
+    # Если пользователь не VIP, добавляем inline-кнопку для быстрой покупки
+    if "PRO" not in stats:
+        await message.answer(stats, reply_markup=get_buy_inline_keyboard())
+    else:
+        await message.answer(stats)
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "💡 **Как пользоваться ботом:**\n\n"
+        "1. Просто отправь голосовое сообщение, видеокружок или аудиофайл.\n"
+        "2. Подожди пару секунд — бот расшифрует текст через **Whisper**.\n"
+        "3. **Gemini AI** сформирует краткую выжимку и выделит главные тезисы.\n\n"
+        "Каждый день доступно 3 бесплатных распознавания."
+    )
+
+
+@dp.message(F.text == "👑 Купить PRO")
+@dp.message(Command("buy"))
+@dp.callback_query(F.data == "buy_pro_stars")
+async def send_invoice_handler(event: types.Message | types.CallbackQuery):
+    chat_id = event.from_user.id
+    
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="👑 PRO-подписка (Безлимит)",
+        description="Снимает дневные лимиты на обработку голосовых сообщений и видеокружков.",
+        payload="pro_status_payload",
+        currency="XTR",
+        prices=[LabeledPrice(label="PRO Безлимит", amount=STARS_PRICE)]
+    )
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    user_id = message.from_user.id
+    set_vip_status(user_id)
+    
+    await message.answer(
+        "🎉 **Оплата прошла успешно!**\n\n"
+        "Вам активирован **PRO-статус 👑**. "
+        "Теперь вы можете отправлять неограниченное количество аудиозаписей!",
+        reply_markup=get_main_keyboard()
+    )
+
+
+# ==========================================
+# 5. Хэндлеры обработки и действий
+# ==========================================
+@dp.message(F.voice | F.audio | F.video_note)
+async def handle_audio(message: types.Message):
+    user_id = message.from_user.id
+    allowed, left = check_and_update_limit(user_id)
+
+    if not allowed:
+        await message.answer(
+            "⚠️ **Превышен дневной лимит!**\n\n"
+            f"Вы исчерпали {DAILY_FREE_LIMIT} бесплатных распознаваний на сегодня.\n\n"
+            "👑 Нажмите **Купить PRO**, чтобы снять ограничения!",
+            reply_markup=get_buy_inline_keyboard()
+        )
+        return
+
+    status_str = "Осталось попыток: " + ("Безлимит 👑" if left == 999 else str(left))
+    status_msg = await message.answer(f"📥 Загружаю аудио... ({status_str})")
+
+    file_obj = message.voice or message.audio or message.video_note
+    file_info = await bot.get_file(file_obj.file_id)
+
+    file_extension = "ogg" if (message.voice or message.video_note) else "mp3"
+    input_path = f"temp_{file_obj.file_id}.{file_extension}"
+
+    try:
+        await bot.download_file(file_info.file_path, input_path)
+
+        await status_msg.edit_text("🎙️ Распознаю речь с помощью Whisper...")
+        with open(input_path, "rb") as file:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(input_path, file.read()),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+
+        transcribed_text = str(transcription).strip()
+
+        if not transcribed_text:
+            await status_msg.edit_text("❌ Не удалось распознать речь или аудио пустое.")
+            return
+
+        await status_msg.edit_text("🧠 Генерирую краткую выжимку...")
+        
+        prompt = (
+            "Ты ассистент-аналитик. Проанализируй текст сообщения и сделай краткую, "
+            "структурированную выжимку на ТЕКСТОВОМ ЯЗЫКЕ ОРИГИНАЛА.\n\n"
+            "Формат ответа (используй язык оригинала):\n"
+            "📌 **Суть сообщения:** (1-2 предложения)\n"
+            "💡 **Главные тезисы:** (3-5 пунктов)\n"
+            "📝 **Задачи / Анонсы:** (если есть)\n\n"
+            f"Текст для анализа:\n{transcribed_text}"
+        )
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+
+        summary_text = response.text
+
+        result_message = (
+            f"📝 **Полный текст:**\n{transcribed_text}\n\n"
+            f"-------------------\n"
+            f"{summary_text}"
+        )
+
+        if len(result_message) > 4000:
+            await status_msg.edit_text(f"📝 **Полный текст:**\n{transcribed_text[:3700]}...\n*(текст сокращен)*")
+            await message.answer(f"-------------------\n{summary_text}", reply_markup=get_action_inline_keyboard())
+        else:
+            await status_msg.edit_text(result_message, reply_markup=get_action_inline_keyboard())
+
+    except Exception as e:
+        await status_msg.edit_text(f"⚠️ Произошла ошибка при обработке: {e}")
+
+    finally:
+        if os.path.exists(input_path):
+            os.remove(input_path)
+
+
+# Обработчик умного перевода RU ⇄ EN
+@dp.callback_query(F.data == "smart_translate")
+async def process_smart_translation(callback: types.CallbackQuery):
+    await callback.answer("Перевожу...")
+    
+    original_text = callback.message.text
+    
+    prompt = (
+        "Проанализируй следующий текст. "
+        "Если текст преимущественно на русском языке — переведи его на АНГЛИЙСКИЙ.\n"
+        "Если текст преимущественно на английском или любом другом языке — переведи его на РУССКИЙ.\n\n"
+        "Важно: Сохрани абсолютно все форматирование (жирный шрифт, переносы строк), "
+        "структуру, заголовки и эмодзи в точности как в оригинале!\n\n"
+        f"Текст для перевода:\n{original_text}"
+    )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt
+        )
+        
+        translated_text = response.text
+        
+        # Меняем клавиатуру после перевода: убираем кнопку перевода, оставляем кнопку удаления
+        builder = InlineKeyboardBuilder()
+        builder.button(text="🗑 Удалить", callback_data="delete_msg")
+        
+        await callback.message.edit_text(
+            f"🌐 **[Перевод]**\n\n{translated_text}",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        await callback.message.answer(f"⚠️ Ошибка при переводе: {e}")
+
+
+# Обработчик кнопки удаления
+@dp.callback_query(F.data == "delete_msg")
+async def process_delete(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Сообщение удалено")
+
+
+async def main():
+    init_db()
+    print("Бот успешно запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())

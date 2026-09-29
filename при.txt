@@ -1,0 +1,590 @@
+import os
+import sqlite3
+import asyncio
+import time
+import subprocess
+import traceback
+from reportlab.pdfbase import pdfmetrics
+from reportlab.pdfbase.ttfonts import TTFont
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer
+from reportlab.lib.styles import getSampleStyleSheet
+from docx import Document
+from aiogram.types import FSInputFile
+from datetime import date
+from dotenv import load_dotenv
+from aiogram import Bot, Dispatcher, F, types
+from aiogram.filters import CommandStart, Command
+from aiogram.types import LabeledPrice, PreCheckoutQuery, ReplyKeyboardMarkup, KeyboardButton, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import ReplyKeyboardBuilder, InlineKeyboardBuilder
+from groq import Groq
+from google import genai
+from config import *
+from database import *
+from keyboards import *
+
+
+
+# 1. Загрузка конфигурации
+
+dp = Dispatcher()
+
+bot = Bot(token=BOT_TOKEN)
+
+groq_client = Groq(api_key=GROQ_API_KEY)
+
+gemini_client = genai.Client(
+    api_key=GEMINI_API_KEY
+)
+
+# Загрузка шрифта
+pdfmetrics.registerFont(
+    TTFont(
+        "NotoSans",
+        "NotoSans-Regular.ttf"
+    )
+)
+
+# 2. Инициализация и функции БД
+
+# 3. Клавиатуры
+
+# 4. Хэндлеры команд и кнопок
+@dp.message(CommandStart())
+async def cmd_start(message: types.Message):
+    await message.answer(
+        "👋 Привет! Я бот-транскрибатор.\n\n"
+        "Присылай мне голосовые сообщения, видеокружки, видео или аудиофайлы — "
+        "я превращу их в текст и сделаю краткую выжимку!\n\n"
+        f"🎁 Вам доступно {DAILY_FREE_LIMIT} бесплатных распознаваний в день.",
+        reply_markup=get_main_keyboard()
+    )
+
+
+@dp.message(F.text == "📊 Профиль")
+@dp.message(Command("profile"))
+async def cmd_profile(message: types.Message):
+    stats = get_user_stats(message.from_user.id)
+    # Если пользователь не VIP, добавляем inline-кнопку для быстрой покупки
+    if "PRO" not in stats:
+        await message.answer(stats, reply_markup=get_buy_inline_keyboard())
+    else:
+        await message.answer(stats)
+
+
+@dp.message(F.text == "ℹ️ Помощь")
+async def cmd_help(message: types.Message):
+    await message.answer(
+        "💡 Как пользоваться ботом:\n\n"
+        "1. Просто отправь голосовое сообщение, видеокружок, видео или аудиофайл.\n"
+        "2. Подожди пару секунд — бот расшифрует текст.\n"
+        "3. Бот сформирует краткую выжимку и выделит главные тезисы.\n\n"
+        "Пользователям без подписки доступно 3 бесплатных распознавания в день."
+    )
+
+
+@dp.message(F.text == "👑 Купить PRO")
+@dp.message(Command("buy"))
+
+@dp.callback_query(F.data == "export_pdf")
+async def export_pdf(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    row = get_last_transcription(user_id)
+
+    if not row:
+        await callback.answer(
+            "Нет данных для экспорта",
+            show_alert=True
+        )
+        return
+
+    data = {
+        "title": row[1],
+        "transcription": row[2],
+        "summary": row[3],
+        "translated": row[4]
+    }
+
+    export_text = data.get(
+        "translated",
+        data.get("summary", "")
+    )
+
+    filename = f"lexivo_{user_id}.pdf"
+
+    doc = SimpleDocTemplate(filename)
+
+    styles = getSampleStyleSheet()
+    styles["Title"].fontName = "NotoSans"
+    styles["Heading1"].fontName = "NotoSans"
+    styles["BodyText"].fontName = "NotoSans"
+
+    story = []
+
+    story.append(
+        Paragraph(
+            data.get("title", "Lexivo Export"),
+            styles["Title"]
+        )
+    )
+
+    story.append(
+        Spacer(1, 12)
+    )
+
+    if "translated" not in data:
+        story.append(
+            Paragraph("Расшифровка", styles["Heading1"])
+        )
+
+        story.append(
+            Paragraph(
+                data["transcription"].replace("\n", "<br/>"),
+                styles["BodyText"]
+            )
+        )
+
+
+    story.append(
+        Spacer(1, 12)
+    )
+
+    story.append(
+        Paragraph("Анализ", styles["Heading1"])
+    )
+
+    story.append(
+        Paragraph(
+            export_text.replace("\n", "<br/>"),
+            styles["BodyText"]
+        )
+    )
+
+    doc.build(story)
+
+    await callback.message.answer_document(
+        FSInputFile(filename),
+        caption="📄 PDF-документ готов"
+    )
+
+    os.remove(filename)
+
+    await callback.answer()
+
+@dp.callback_query(F.data == "export_docx")
+async def export_docx(callback: types.CallbackQuery):
+    user_id = callback.from_user.id
+
+    row = get_last_transcription(user_id)
+
+    if not row:
+        await callback.answer(
+            "Нет данных для экспорта",
+            show_alert=True
+        )
+        return
+
+    data = {
+        "title": row[1],
+        "transcription": row[2],
+        "summary": row[3],
+        "translated": row[4]
+    }
+
+    filename = f"lexivo_{user_id}.docx"
+
+    # Достаем перевод, а если его нет — берем оригинальный summary
+    export_text = data.get("translated", data.get("summary", ""))
+
+    doc = Document()
+
+    doc.add_heading(
+        data.get("title", "Lexivo Export"),
+        level=1
+    )
+
+
+    # Если перевода не было, экспортируем оригинальную транскрипцию
+    if "translated" not in data:
+        doc.add_heading(
+            "Расшифровка",
+            level=2
+        )
+        doc.add_paragraph(
+            data.get("transcription", "")
+        )
+
+    doc.add_heading(
+        "Результат / Анализ",
+        level=2
+    )
+
+    doc.add_paragraph(export_text)
+
+    doc.save(filename)
+
+    await callback.message.answer_document(
+        FSInputFile(filename),
+        caption="📝 Готовый Word-документ"
+    )
+
+    if os.path.exists(filename):
+        os.remove(filename)
+
+    await callback.answer()
+
+@dp.callback_query(F.data == "buy_pro_stars")
+async def send_invoice_handler(event: types.Message | types.CallbackQuery):
+    chat_id = event.from_user.id
+    
+    await bot.send_invoice(
+        chat_id=chat_id,
+        title="👑 PRO-подписка (Безлимит)",
+        description="Снимает дневные лимиты на обработку голосовых сообщений и видеокружков.",
+        payload="pro_status_payload",
+        currency="XTR",
+        prices=[LabeledPrice(label="PRO Безлимит", amount=STARS_PRICE)]
+    )
+    if isinstance(event, types.CallbackQuery):
+        await event.answer()
+
+
+@dp.pre_checkout_query()
+async def process_pre_checkout(pre_checkout_query: PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(pre_checkout_query.id, ok=True)
+
+
+@dp.message(F.successful_payment)
+async def process_successful_payment(message: types.Message):
+    user_id = message.from_user.id
+    set_vip_status(user_id)
+    
+    await message.answer(
+        "🎉 Оплата прошла успешно!\n\n"
+        "Вам активирован PRO-статус 👑. "
+        "Теперь вы можете отправлять неограниченное количество аудиозаписей!",
+        reply_markup=get_main_keyboard()
+    )
+
+
+# ==========================================
+# 5. Хэндлеры обработки и действий
+# ==========================================
+@dp.message(F.voice | F.audio | F.video_note | F.video)
+async def handle_audio(message: types.Message):
+    user_id = message.from_user.id
+    allowed, left = check_and_update_limit(user_id)
+
+    if not allowed:
+        await message.answer(
+            "⚠️ Превышен дневной лимит!\n\n"
+            f"Вы исчерпали {DAILY_FREE_LIMIT} бесплатных распознаваний на сегодня.\n\n"
+            "👑 Оплатите подписку, чтобы снять ограничения!",
+            reply_markup=get_buy_inline_keyboard()
+        )
+        return
+
+    status_str = "Осталось попыток: " + ("Безлимит 👑" if left == 999 else str(left))
+    status_msg = await message.answer(f"📥 Загружаю файл... ({status_str})")
+
+    audio_path = None
+
+    try:
+        # Определяем тип файла
+        if message.voice:
+            file_obj = message.voice
+            file_extension = "ogg"
+
+        elif message.audio:
+            file_obj = message.audio
+            file_extension = "mp3"
+
+        elif message.video_note:
+            file_obj = message.video_note
+            file_extension = "mp4"
+
+        elif message.video:
+            file_obj = message.video
+            file_extension = "mp4"
+
+        else:
+            await status_msg.edit_text("❌ Неподдерживаемый формат файла.")
+            return
+
+        file_info = await bot.get_file(file_obj.file_id)
+
+        input_path = f"temp_{file_obj.file_id}.{file_extension}"
+
+        await bot.download_file(
+            file_info.file_path,
+            destination=input_path
+        )
+
+        transcription_file = input_path
+
+        # Видео -> WAV
+        if message.video or message.video_note:
+            await status_msg.edit_text(
+                "🎬 Видео получено. Извлекаю звук..."
+            )
+
+            audio_path = f"audio_{file_obj.file_id}.wav"
+
+            subprocess.run(
+                [
+                    "ffmpeg",
+                    "-i",
+                    input_path,
+                    "-vn",
+                    "-acodec",
+                    "pcm_s16le",
+                    "-ar",
+                    "16000",
+                    "-ac",
+                    "1",
+                    audio_path,
+                    "-y"
+                ],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=True
+            )
+
+            transcription_file = audio_path
+
+        await status_msg.edit_text(
+            "🎙️ Расшифровка"
+        )
+
+        with open(transcription_file, "rb") as file:
+            transcription = groq_client.audio.transcriptions.create(
+                file=(transcription_file, file.read()),
+                model="whisper-large-v3",
+                response_format="text"
+            )
+
+        transcribed_text = str(transcription).strip()
+
+        title = transcribed_text[:50]
+
+        try:
+            title_response = gemini_client.models.generate_content(
+                model="gemini-3.6-flash",
+                contents=(
+                    "Придумай короткий заголовок для текста.\n"
+                    "Максимум 5 слов.\n"
+                    "Без кавычек.\n"
+                    "Только сам заголовок.\n\n"
+                    f"{transcribed_text[:2000]}"
+                )
+            )
+
+            if title_response.text:
+                title = title_response.text.strip()
+
+        except Exception:
+            pass
+
+        if not transcribed_text:
+            await status_msg.edit_text(
+                "❌ Не удалось распознать речь или аудио пустое."
+            )
+            return
+
+        await status_msg.edit_text(
+            "🧠 Генерирую краткую выжимку..."
+        )
+
+        prompt = (
+    "Ты ассистент-аналитик.\n\n"
+    "Верни результат строго в формате:\n\n"
+    "📌 Суть\n"
+    "Краткое описание.\n\n"
+    "💡 Основные моменты\n"
+    "• пункт 1\n"
+    "• пункт 2\n"
+    "• пункт 3\n\n"
+    "✅ Задачи\n"
+    "• задача 1\n"
+    "• задача 2\n\n"
+    f"Текст:\n{transcribed_text}"
+    )
+
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+
+        summary_text = response.text
+       
+
+
+        if len(title) > 50:
+            title += "..."
+
+        
+
+        save_transcription(
+            user_id=user_id,
+            title=title,
+            transcription=transcribed_text,
+            summary=summary_text
+        )
+
+        result_message = (
+            f"📝 Полный текст:\n{transcribed_text}\n\n"
+            f"━━━━━━━━━━━━━━━━━\n"
+            f"{summary_text}"
+        )
+
+        if len(result_message) > 4000:
+            await status_msg.edit_text(
+                f"📝 Полный текст:\n"
+                f"{transcribed_text[:3700]}...\n"
+                f"*(текст сокращён)*"
+            )
+
+            await message.answer(
+                f"━━━━━━━━━━━━━━━━━\n{summary_text}",
+                reply_markup=get_action_inline_keyboard()
+            )
+        else:
+            await status_msg.edit_text(
+                result_message,
+                reply_markup=get_action_inline_keyboard()
+            )
+
+    except Exception as e:
+        traceback.print_exc()
+
+        await status_msg.edit_text(
+            f"⚠️ Ошибка обработки:\n{e}"
+        )
+
+    finally:
+        if 'input_path' in locals() and os.path.exists(input_path):
+            os.remove(input_path)
+
+        if audio_path and os.path.exists(audio_path):
+            os.remove(audio_path)
+
+
+# Обработчик умного перевода RU ⇄ EN
+@dp.callback_query(F.data == "smart_translate")
+async def process_smart_translation(callback: types.CallbackQuery):
+    await callback.answer("Перевожу...")
+    
+    original_text = callback.message.text
+    
+    prompt = (
+        "Проанализируй следующий текст. "
+        "Если текст преимущественно на русском языке — переведи его на АНГЛИЙСКИЙ.\n"
+        "Если текст преимущественно на английском или любом другом языке — переведи его на РУССКИЙ.\n\n"
+        "Важно: Сохрани абсолютно все форматирование (жирный шрифт, переносы строк), "
+        "структуру, заголовки и эмодзи в точности как в оригинале!\n\n"
+        f"Текст для перевода:\n{original_text}"
+    )
+
+    try:
+        response = gemini_client.models.generate_content(
+            model="gemini-3.6-flash",
+            contents=prompt
+        )
+        
+        translated_text = response.text
+
+        user_id = callback.from_user.id
+        conn = sqlite3.connect(DB_PATH)
+        cursor = conn.cursor()
+
+        cursor.execute(
+            """
+            UPDATE transcriptions
+            SET translated = ?
+            WHERE id = (
+                SELECT MAX(id)
+                FROM transcriptions
+                WHERE user_id = ?
+            )
+            """,
+        (
+        translated_text,
+        user_id
+        )
+)
+
+        conn.commit()
+        conn.close()
+
+
+        
+        
+        # Меняем клавиатуру после перевода: убираем кнопку перевода, оставляем кнопку удаления
+        builder = InlineKeyboardBuilder()
+
+        builder.button(
+            text="📄 PDF",
+            callback_data="export_pdf"
+        )
+
+        builder.button(
+            text="📝 Word",
+            callback_data="export_docx"
+    )
+
+        builder.button(
+            text="🗑 Удалить",
+            callback_data="delete_msg"
+        )           
+
+        builder.adjust(2, 1)
+        
+        await callback.message.edit_text(
+            f"🌐 **[Перевод]**\n\n{translated_text}",
+            reply_markup=builder.as_markup()
+        )
+    except Exception as e:
+        await callback.message.answer(f"⚠️ Ошибка при переводе: {e}")
+
+
+# Обработчик кнопки удаления
+@dp.callback_query(F.data == "delete_msg")
+async def process_delete(callback: types.CallbackQuery):
+    await callback.message.delete()
+    await callback.answer("Сообщение удалено")
+
+
+# Команда истории
+@dp.message(Command("history"))
+async def cmd_history(message: types.Message):
+
+    rows = get_last_transcriptions(
+        message.from_user.id
+    )
+
+    if not rows:
+        await message.answer(
+            "📚 История пока пуста."
+        )
+        return
+
+    text = "📚 Последние расшифровки:\n\n"
+
+    for row in rows:
+        text += (
+            f"🎙️ {row[1]}\n"
+            f"📅 {row[2]}\n\n"
+        )
+
+    await message.answer(text)
+
+
+async def main():
+    init_db()
+    print("Бот успешно запущен!")
+    await dp.start_polling(bot)
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
